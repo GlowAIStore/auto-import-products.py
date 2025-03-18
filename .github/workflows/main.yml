@@ -1,0 +1,32 @@
+name: Auto Import CJ Products
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: '0 0 * * *'  # تشغيل مرة يومياً عند منتصف الليل UTC
+
+jobs:
+  import_products:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 🔄 Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: 🏗️ Setup Python
+        uses: actions/setup-python@v3
+        with:
+          python-version: '3.9'
+
+      - name: 📦 Install Dependencies
+        run: pip install requests
+
+      - name: 🔑 Load Secrets
+        run: |
+          echo "SHOPIFY_API_KEY=${{ secrets.SHOPIFY_API_KEY }}" >> $GITHUB_ENV
+          echo "CJ_API_KEY=${{ secrets.CJ_API_KEY }}" >> $GITHUB_ENV
+
+      - name: 🚀 Run Import Script
+        run: python import_products.py
