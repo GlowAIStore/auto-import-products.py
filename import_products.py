@@ -4,7 +4,7 @@ import os
 
 # مفاتيح API
 SHOPIFY_API_KEY = os.getenv('SHOPIFY_API_KEY')
-SHOPIFY_STORE_URL = "https://zwfjit-uj.myshopify.com/admin/api/2025-01"
+SHOPIFY_STORE_URL = "https://www.glowaistore.com/admin/api/2025-01"
 CJ_API_KEY = os.getenv('CJ_API_KEY')
 
 # هامش الربح (35%)
