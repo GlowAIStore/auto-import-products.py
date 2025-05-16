@@ -1,32 +1,129 @@
-name: Auto Import CJ Products
+// autoSync-final.js (final fixed version for AutoDS only)
+import 'dotenv/config';
+import axios from 'axios';
+import { getTagFromTitle, getCollectionId } from './lib/classify.js';
 
-on:
-  push:
-    branches:
-      - main
-  schedule:
-    - cron: '0 0 * * *'  # تشغيل مرة يومياً عند منتصف الليل UTC
+const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN;
+const SHOPIFY_ACCESS_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
+const AUTODS_API_TOKEN = process.env.AUTODS_API_TOKEN;
+const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || '2025-04';
 
-jobs:
-  import_products:
-    runs-on: ubuntu-latest
+const shopify = axios.create({
+  baseURL: `https://${SHOPIFY_STORE_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}`,
+  headers: {
+    'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN,
+    'Content-Type': 'application/json',
+  },
+});
 
-    steps:
-      - name: 🔄 Checkout Repository
-        uses: actions/checkout@v3
+function shortenTitle(title) {
+  const maxLength = 60;
+  const clean = title.replace(/\s+/g, ' ').trim();
+  return clean.length > maxLength ? `${clean.slice(0, maxLength)}...` : clean;
+}
 
-      - name: 🏗️ Setup Python
-        uses: actions/setup-python@v3
-        with:
-          python-version: '3.9'
+function isSuspiciousVendor(vendor) {
+  return /temu|shein|wish|alibaba/i.test(vendor);
+}
 
-      - name: 📦 Install Dependencies
-        run: pip install requests
+function isBadProduct(product) {
+  return !product.title || !product.price || !product.images || product.images.length === 0;
+}
 
-      - name: 🔑 Load Secrets
-        run: |
-          echo "SHOPIFY_API_KEY=${{ secrets.SHOPIFY_API_KEY }}" >> $GITHUB_ENV
-          echo "CJ_API_KEY=${{ secrets.CJ_API_KEY }}" >> $GITHUB_ENV
+const seenSKUs = new Set();
 
-      - name: 🚀 Run Import Script
-        run: python import_products.py
+async function fetchAutoDSProducts() {
+  try {
+    console.log('[GlowAI] Fetching products from AutoDS...');
+    const res = await axios.get('https://api.autods.com/v1/products', {
+      headers: { Authorization: `Bearer ${AUTODS_API_TOKEN}` },
+    });
+    return res.data.products || [];
+  } catch (err) {
+    console.error('[GlowAI] Failed to fetch AutoDS products:', err.message);
+    return [];
+  }
+}
+
+async function checkExistingProduct(sku) {
+  try {
+    let page = 1;
+    while (true) {
+      const res = await shopify.get(`/products.json?limit=250&page=${page}`);
+      const products = res.data.products;
+      if (!products.length) break;
+      const found = products.find(p =>
+        p.variants.some(v => v.sku && v.sku.toLowerCase() === sku.toLowerCase())
+      );
+      if (found) return true;
+      page++;
+    }
+    return false;
+  } catch (err) {
+    console.error('Error checking existing product:', err.message);
+    return false;
+  }
+}
+
+async function updateOrCreateShopifyProduct(autoProduct) {
+  const tag = getTagFromTitle(autoProduct.title);
+  if (!tag) return;
+  if (isSuspiciousVendor(autoProduct.supplier_name)) return;
+  if (isBadProduct(autoProduct)) return;
+  if (seenSKUs.has(autoProduct.sku)) return;
+
+  const exists = await checkExistingProduct(autoProduct.sku);
+  if (exists) return;
+
+  seenSKUs.add(autoProduct.sku);
+
+  const title = shortenTitle(autoProduct.title);
+  const collectionId = getCollectionId(tag);
+
+  const shopifyProduct = {
+    product: {
+      title,
+      body_html: autoProduct.body_html || `<p>${autoProduct.title}</p>`,
+      vendor: autoProduct.supplier_name || 'AutoDS Supplier',
+      status: autoProduct.stock === 0 ? 'draft' : 'active',
+      tags: [tag],
+      variants: [{
+        price: autoProduct.price,
+        sku: autoProduct.sku,
+        inventory_quantity: autoProduct.stock,
+        inventory_management: 'shopify',
+      }],
+      images: autoProduct.images.map(src => ({ src })),
+    },
+  };
+
+  try {
+    const created = await shopify.post('/products.json', shopifyProduct);
+    const id = created.data.product.id;
+    if (collectionId) {
+      await shopify.post('/collects.json', {
+        collect: {
+          product_id: id,
+          collection_id: collectionId,
+        },
+      });
+    }
+    console.log(`✅ Synced: ${title}`);
+  } catch (err) {
+    console.error(`❌ Failed to sync ${title}:`, err.response?.data || err.message);
+  }
+}
+
+async function syncAll() {
+  console.log('\n🔄 Starting AutoDS Sync...');
+  const products = await fetchAutoDSProducts();
+  console.log(`➡️  Found ${products.length} AutoDS products.`);
+
+  for (const product of products) {
+    await updateOrCreateShopifyProduct(product);
+  }
+
+  console.log('✅ AutoDS Sync Complete.\n');
+}
+
+syncAll();
