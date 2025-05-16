@@ -1,114 +1,127 @@
-import requests
-import json
-import os
+// autoSync.js
+import 'dotenv/config';
+import axios from 'axios';
+import { getTagFromTitle, getCollectionId } from './lib/classify.js';
 
-# مفاتيح API
-SHOPIFY_API_KEY = os.getenv('SHOPIFY_API_KEY')
-SHOPIFY_STORE_URL = "https://www.glowaistore.com/admin/api/2025-01"
-CJ_API_KEY = os.getenv('CJ_API_KEY')
+const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN;
+const SHOPIFY_ACCESS_TOKEN = process.env.SHOPIFY_ACCESS_TOKEN;
+const AUTODS_API_TOKEN = process.env.AUTODS_API_TOKEN;
+const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || '2025-04';
 
-# هامش الربح (35%)
-PROFIT_MARGIN = 1.35  
+const shopify = axios.create({
+  baseURL: `https://${SHOPIFY_STORE_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}`,
+  headers: {
+    'X-Shopify-Access-Token': SHOPIFY_ACCESS_TOKEN,
+    'Content-Type': 'application/json',
+  },
+});
 
-# جلب المنتجات من CJ Dropshipping
-def get_cj_products():
-    url = "https://developers.cjdropshipping.com/api/product/list"
-    headers = {
-        "CJ-Access-Token": CJ_API_KEY,
-        "Content-Type": "application/json"
+function shortenTitle(title) {
+  const maxLength = 60;
+  const clean = title.replace(/\s+/g, ' ').trim();
+  return clean.length > maxLength ? `${clean.slice(0, maxLength)}...` : clean;
+}
+
+function isSuspiciousVendor(vendor) {
+  return /temu|shein|wish|alibaba/i.test(vendor);
+}
+
+function isBadProduct(product) {
+  return !product.title || !product.price || !product.images || product.images.length === 0;
+}
+
+const seenSKUs = new Set();
+
+async function fetchAutoDSProducts() {
+  try {
+    const res = await axios.get('https://api.autods.com/v1/products', {
+      headers: { Authorization: `Bearer ${AUTODS_API_TOKEN}` },
+    });
+    return res.data.products || [];
+  } catch (err) {
+    console.error('[AutoSync] ❌ Failed to fetch AutoDS products:', err.message);
+    return [];
+  }
+}
+
+async function findProductBySKU(sku) {
+  try {
+    let page = 1;
+    while (true) {
+      const res = await shopify.get(`/products.json?limit=250&page=${page}`);
+      const products = res.data.products;
+      if (!products.length) break;
+      const found = products.find(p => p.variants.some(v => v.sku && v.sku.toLowerCase() === sku.toLowerCase()));
+      if (found) return found;
+      page++;
     }
-    payload = {
-        "pageSize": 10,  # يمكنك زيادة العدد حسب الحاجة
-        "pageNum": 1,
-        "categoryName": "Beauty & Health"  
+    return null;
+  } catch (err) {
+    console.error('[AutoSync] ❌ Failed to check product SKU:', err.message);
+    return null;
+  }
+}
+
+async function syncProduct(product) {
+  if (isBadProduct(product)) return;
+  if (seenSKUs.has(product.sku)) return;
+  if (isSuspiciousVendor(product.supplier_name)) return;
+
+  const tag = getTagFromTitle(product.title);
+  if (!tag) return;
+
+  const existing = await findProductBySKU(product.sku);
+  if (existing) return;
+
+  const title = shortenTitle(product.title);
+  const body = product.body_html || `<p>${product.title}</p>`; // retain AutoDS description
+  const price = product.price.toFixed(2);
+  const collectionId = getCollectionId(tag);
+
+  try {
+    const created = await shopify.post('/products.json', {
+      product: {
+        title,
+        body_html: body,
+        vendor: product.supplier_name || 'AutoDS Supplier',
+        status: product.stock === 0 ? 'draft' : 'active',
+        tags: [tag],
+        variants: [
+          {
+            price,
+            sku: product.sku,
+            inventory_quantity: product.stock,
+            inventory_management: 'shopify',
+          },
+        ],
+        images: product.images.map(src => ({ src })),
+      },
+    });
+
+    if (collectionId) {
+      await shopify.post('/collects.json', {
+        collect: {
+          product_id: created.data.product.id,
+          collection_id: collectionId,
+        },
+      });
     }
 
-    response = requests.post(url, headers=headers, json=payload)
-    if response.status_code == 200:
-        return response.json().get('data', {}).get('list', [])
-    else:
-        print("❌ خطأ في جلب المنتجات:", response.text)
-        return []
+    seenSKUs.add(product.sku);
+    console.log(`[AutoSync] ✅ Created: ${title} → ${tag}`);
+  } catch (err) {
+    console.error(`[AutoSync] ❌ Failed to create product ${title}:`, err.response?.data || err.message);
+  }
+}
 
-# جلب قائمة المنتجات الحالية من Shopify
-def get_shopify_products():
-    url = f"{SHOPIFY_STORE_URL}/products.json"
-    headers = {
-        "X-Shopify-Access-Token": SHOPIFY_API_KEY
-    }
-    
-    response = requests.get(url, headers=headers)
-    if response.status_code == 200:
-        return response.json().get('products', [])
-    else:
-        print("❌ فشل في جلب منتجات Shopify:", response.text)
-        return []
+async function runAutoSync() {
+  console.log('[AutoSync] 🚀 Starting sync...');
+  const products = await fetchAutoDSProducts();
+  console.log(`[AutoSync] 🔍 Fetched ${products.length} products.`);
+  for (const p of products) {
+    await syncProduct(p);
+  }
+  console.log('[AutoSync] ✅ Sync completed.');
+}
 
-# حذف المنتجات المنتهية من Shopify
-def delete_old_products(existing_products, new_products):
-    existing_skus = {product['variants'][0]['sku']: product['id'] for product in existing_products}
-    new_skus = {product.get("sku", "") for product in new_products}
-
-    for sku, product_id in existing_skus.items():
-        if sku not in new_skus:
-            url = f"{SHOPIFY_STORE_URL}/products/{product_id}.json"
-            headers = {"X-Shopify-Access-Token": SHOPIFY_API_KEY}
-            response = requests.delete(url, headers=headers)
-            if response.status_code == 200:
-                print(f"🗑️ تم حذف المنتج المنتهي: {sku}")
-            else:
-                print(f"❌ فشل في حذف المنتج {sku}: {response.text}")
-
-# إضافة المنتجات إلى Shopify
-def add_product_to_shopify(product):
-    url = f"{SHOPIFY_STORE_URL}/products.json"
-    headers = {
-        "X-Shopify-Access-Token": SHOPIFY_API_KEY,
-        "Content-Type": "application/json"
-    }
-
-    # حساب السعر بعد إضافة هامش الربح
-    original_price = float(product.get("sellPrice", 0))
-    final_price = round(original_price * PROFIT_MARGIN, 2)
-
-    product_data = {
-        "product": {
-            "title": product.get("name", "منتج غير معروف"),
-            "body_html": product.get("description", ""),
-            "vendor": "CJ Dropshipping",
-            "product_type": "Beauty & Health",
-            "tags": ["Beauty", "Skincare", "Health"],
-            "variants": [
-                {
-                    "price": str(final_price),
-                    "sku": product.get("sku", ""),
-                    "inventory_management": "shopify",
-                    "inventory_quantity": 10,
-                }
-            ],
-            "images": [{"src": img} for img in product.get("imageUrls", [])]
-        }
-    }
-
-    response = requests.post(url, headers=headers, json=product_data)
-    if response.status_code == 201:
-        print(f"✅ تمت إضافة المنتج: {product['name']} بسعر {final_price} دولار")
-    else:
-        print(f"❌ فشل في إضافة المنتج {product['name']}: {response.text}")
-
-# تنفيذ الاستيراد التلقائي
-def import_products():
-    print("🔄 جلب المنتجات من CJ Dropshipping...")
-    new_products = get_cj_products()
-    existing_products = get_shopify_products()
-
-    print("🔄 حذف المنتجات المنتهية من Shopify...")
-    delete_old_products(existing_products, new_products)
-
-    print("🔄 إضافة المنتجات الجديدة...")
-    for product in new_products:
-        add_product_to_shopify(product)
-
-# تشغيل الوظيفة
-if __name__ == "__main__":
-    import_products()
+runAutoSync();
